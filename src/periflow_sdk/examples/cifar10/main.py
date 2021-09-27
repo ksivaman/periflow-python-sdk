@@ -14,23 +14,25 @@ import argparse
 import math
 
 from models import *
-from utils import progress_bar
 
-from periflow_sdk.manager import TrainStepOutput, init, periflow_trainer
+from periflow_sdk.manager import TrainStepOutput, init, periflow_trainer, add_modules_and_recover, recover_samplers
+from periflow_sdk.dataloading.sampler import ResumableRandomSampler
 
 @dataclass
 class CIFAR10TrainStepOutput(TrainStepOutput):
+    iteration: int
     training_loss: float
     learning_rate: float
 
 
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
 parser.add_argument('--total-steps', '-s', default=58800, type=int, help='The total number of training steps')
-parser.add_argument('--consumed-steps', '-cs', default=0, type=int, help='The checkpointed steps')
-parser.add_argument('--save_interval', '-i', default=50, type=int, help='The checkpoint save intervals')
-parser.add_argument('--save_dir', '-dir', default='save', type=str, help='The path to the save directory')
+parser.add_argument('--batch-size', '-b', default=256, type=int, help='The default batch size')
+parser.add_argument('--save-interval', '-i', default=500, type=int, help='The checkpoint save intervals')
+parser.add_argument('--save-dir', '-dir', default='save', type=str, help='The path to the save directory')
+parser.add_argument('--local_rank', '-r', default=0, type=int, help='The local rank of this process')
+parser.add_argument('--seed', default=777, type=int, help='The seed for random generator')
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -51,16 +53,6 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
-trainset = torchvision.datasets.CIFAR10(
-    root='./data', train=True, download=True, transform=transform_train)
-trainloader = torch.utils.data.DataLoader(
-    trainset, batch_size=256, shuffle=True, num_workers=4)
-
-testset = torchvision.datasets.CIFAR10(
-    root='./data', train=False, download=True, transform=transform_test)
-testloader = torch.utils.data.DataLoader(
-    testset, batch_size=100, shuffle=False, num_workers=4)
-
 classes = ('plane', 'car', 'bird', 'cat', 'deer',
            'dog', 'frog', 'horse', 'ship', 'truck')
 
@@ -68,25 +60,43 @@ classes = ('plane', 'car', 'bird', 'cat', 'deer',
 print('==> Building model..')
 net = VGG('VGG16')
 net = net.to(device)
-if device == 'cuda':
+world_size = 0 if 'WORLD_SIZE' not in os.environ else int(os.environ['WORLD_SIZE'])
+is_ddp = world_size > 1
+
+if is_ddp:
+    torch.distributed.init_process_group(backend='nccl', init_method='env://')
+    torch.cuda.set_device(args.local_rank)
+    net.cuda(args.local_rank)
+    net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.local_rank])
+
+elif device == 'cuda':
     net = torch.nn.DataParallel(net)
     cudnn.benchmark = True
 
+trainset = torchvision.datasets.CIFAR10(
+    root='./data', train=True, download=True, transform=transform_train)
+if is_ddp:
+    # Use distributed sampler
+    sampler = ResumableRandomSampler(len(trainset),
+                                     args.batch_size,
+                                     False,
+                                     77,
+                                     args.local_rank,
+                                     world_size)
+else:
+    sampler = ResumableRandomSampler(len(trainset), args.batch_size, False)
+trainloader = torch.utils.data.DataLoader(
+    trainset, batch_sampler=sampler, num_workers=4)
 
-#if args.resume:
-    # Load checkpoint.
-#    print('==> Resuming from checkpoint..')
-#    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
-#    checkpoint = torch.load('./checkpoint/ckpt.pth')
-#    net.load_state_dict(checkpoint['net'])
-#    best_acc = checkpoint['acc']
- #   start_epoch = checkpoint['epoch']
-
+testset = torchvision.datasets.CIFAR10(
+    root='./data', train=False, download=True, transform=transform_test)
+testloader = torch.utils.data.DataLoader(
+    testset, batch_size=100, shuffle=False, num_workers=4)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr,
                       momentum=0.9, weight_decay=5e-4)
-steps_per_epoch = math.ceil(50000 / 256)
+steps_per_epoch = math.ceil(len(trainset) / args.batch_size)
 scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                  milestones=[100 * steps_per_epoch, 200 * steps_per_epoch],
                                                  gamma=0.1)
@@ -107,18 +117,13 @@ def train_batch(inputs,
     optimizer.step()
     lr_scheduler.step()
 
-    #train_loss += loss.item()
-    #_, predicted = outputs.max(1)
-    #total += targets.size(0)
-    #correct += predicted.eq(targets).sum().item()
-
     # Automatically logged.
     return CIFAR10TrainStepOutput(iteration=iteration,
                                   training_loss=loss.item(),
                                   learning_rate=lr_scheduler.get_last_lr())
 
 
-def test(epoch):
+def test():
     global best_acc
     net.eval()
     test_loss = 0
@@ -134,41 +139,34 @@ def test(epoch):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-
-            progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss/(batch_idx+1), 100.*correct/total, correct, total))
-
-    # Save checkpoint.
-    acc = 100.*correct/total
-    if acc > best_acc:
-        print('Saving..')
-        state = {
-            'net': net.state_dict(),
-            'acc': acc,
-            'epoch': epoch,
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/ckpt.pth')
-        best_acc = acc
+    return 100.*correct/total
 
 
-epoch = 1
 trainloader_iter = iter(trainloader)
 
 net.train()
 
-init(args.total_steps, args.save_interval, args.save_dir)
+latest_step = init(args.total_steps,
+                args.save_interval,
+                args.save_dir,
+                local_rank=args.local_rank)
+add_modules_and_recover({
+    'model': net,
+    'optimizer': optimizer,
+    'lr_scheduler': scheduler})
+recover_samplers([sampler])
 
-for step in range(args.consumed_steps + 1, args.total_steps + 1):
+epoch = latest_step * args.batch_size // len(trainset) + 1
+
+for step in range(latest_step + 1, args.total_steps + 1):
     try:
         inputs, targets = next(trainloader_iter)
         inputs = inputs.to(device)
         targets = targets.to(device)
     except StopIteration:
         # This indicates an end of epoch.
-        test(epoch)
-        print(f"Epoch {epoch} has finished!")
+        acc = test()
+        print(f"Epoch {epoch} has finished! Accuracy = {acc}")
         net.train()
         epoch += 1
 

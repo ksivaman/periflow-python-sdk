@@ -11,6 +11,7 @@ from contextlib import suppress
 from concurrent.futures.thread import ThreadPoolExecutor
 from concurrent.futures import CancelledError
 from typing import List, Optional
+import logging
 
 from .errors import (
     IpcChannelIOError,
@@ -18,6 +19,8 @@ from .errors import (
     IpcTimeoutException,
     IpcConnectionFailureException,
 )
+
+periflow_logger = logging.getLogger("periflow")
 
 
 class CommResultStatus(str, Enum):
