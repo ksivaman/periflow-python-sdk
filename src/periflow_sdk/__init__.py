@@ -42,7 +42,7 @@ class TrainingManager:
         else:
             self._is_local = is_local
         self._total_train_steps = None
-        self._cur_step = 0
+        self._cur_step = -1
         self._step_info_ipc_channel = None
         self._ack_ipc_channel = None
         self._emergency_save_ipc_channel = None
@@ -53,16 +53,12 @@ class TrainingManager:
         self._save_method = SaveType.NORMAL
         self._checkpoint_path = None
         self._step_start_time = None
-        if self._is_local:
-            if log_file_name is None:
-                self._log_path = Path(f"./periflow_trainer_{int(time.time())}.log")
-            else:
-                self._log_path = Path(log_file_name)
-        else:
-            self._log_path = None
+        self._log_path = None
         self._has_locally_logged = False
         self._teardown_at_exit = teardown_at_exit
         self._emergency_save_step = -1
+        self._has_initialized = False
+        self._dist_config = None
 
     @property
     def _is_step_started(self) -> bool:
@@ -70,21 +66,27 @@ class TrainingManager:
 
     def init(self,
              total_train_steps: int,
-             processed_steps: int = 0,
-             local_rank: int = 0) -> None:
+             local_log_name: Optional[str] = None) -> None:
         """ Initialize training manager.
 
         Arguments:
             - total_train_steps: The number of total training steps
-            - processed_steps: How many training steps processed before init()?
             - local_rank: The local rank of this training process
         """
         self._total_train_steps = total_train_steps
-        self._cur_step = processed_steps
 
         if self._is_local:
-            self._local_rank = local_rank
             periflow_logger.debug("Periflow SDK is working in local mode.")
+            if local_log_name is not None:
+                self._log_path = Path(local_log_name)
+            else:
+                if torch.distributed.is_initialized():
+                    # To prevent path overlap among processes, we add rank at the end of the log file name.
+                    rank = torch.distributed.get_rank()
+                    self._log_path = Path(f"./periflow_trainer_{int(time.time())}_{rank}.log")
+                else:
+                    self._log_path = Path(f"./periflow_trainer_{int(time.time())}.log")
+            self._local_rank = None
         else:
             periflow_logger.debug("Periflow SDK is working in cloud mode.")
 
@@ -93,7 +95,8 @@ class TrainingManager:
                                  "RANK",
                                  "WORLD_SIZE",
                                  "NODE_RANK",
-                                 "NUM_NODES"]
+                                 "NUM_NODES",
+                                 "PROCESSED_ITERS"]
 
             for env_var in required_env_vars:
                 assert env_var in os.environ, f"Environment variable '{env_var}' should be set in cloud mode!"
@@ -105,6 +108,7 @@ class TrainingManager:
             ensure_divisibility(world_size, num_nodes)
             devices_per_node = world_size // num_nodes
             local_rank = rank % devices_per_node
+            self._cur_step = int(os.environ.get("PROCESSED_ITERS"))
             self._dist_config = DistributeConfig(local_rank=local_rank, rank=rank)
             ensure_valid_parallelism_config(self._dist_config)
 
@@ -129,6 +133,8 @@ class TrainingManager:
         if self._teardown_at_exit:
             # teardown will be called at exit of the program.
             atexit.register(self._teardown)
+
+        self._has_initialized = True
 
     def _teardown(self) -> None:
         """ Clean up resources.
@@ -155,21 +161,28 @@ class TrainingManager:
         else:
             self._emergency_save_step = msg['emergency_save_step']
 
+    def get_current_step(self) -> int:
+        assert self._has_initialized, "get_current_step() must be called after init()!"
+        return self._cur_step
+
     def start_step(self) -> None:
         """
         Start a new training step.
         Returns: None
         """
+        assert self._has_initialized, "start_step() must be called after init()!"
         assert not self._is_step_started, "Existing steps must finish before calling start_step()!"
         self._step_start_time = time.monotonic()
-        self._cur_step += 1
         self._is_saved = False
+        if not self._is_local:
+            self._cur_step += 1
 
     def end_step(self) -> None:
         """
         Finish the current training step.
         Returns: None
         """
+        assert self._has_initialized, "end_step() must be called after init()!"
         assert self._is_step_started, "Existing steps must start before calling end_step()!"
         step_time = time.monotonic() - self._step_start_time
         if not self._is_local:
@@ -218,6 +231,7 @@ class TrainingManager:
         Informs whether emergency save should be handled this step or not.
         Returns: 'True' if emergency save is set, 'False' if not.
         """
+        assert self._has_initialized, "is_emergency_save() must be called after init()!"
         return self._emergency_save_step == self._cur_step
 
     def _local_log(self, msg):
@@ -235,9 +249,10 @@ class TrainingManager:
         Returns: None
 
         """
+        assert self._has_initialized, "metric() must be called after init()!"
         new_msg = msg.copy()
-        new_msg["step"] = self._cur_step
         if not self._is_local:
+            new_msg["step"] = self._cur_step
             new_msg["rank"] = self._dist_config.rank
             new_msg["local_rank"] = self._dist_config.local_rank
         if self._is_local:
@@ -254,7 +269,7 @@ class TrainingManager:
             path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    def load(self, path: Union[os.PathLike, str]) -> Any:
+    def load(self, path: Union[os.PathLike, str], *args, **kwargs) -> Any:
         """
         Load the saved object from persistent storage. In local mode, this is same as `torch.save()`.
         In cloud mode, it ignores the 'path' and loads from the cloud path.
@@ -264,9 +279,10 @@ class TrainingManager:
         Returns: Loaded object
 
         """
+        assert self._has_initialized, "load() must be called after init()!"
         if not self._is_local:
             path = self._get_cloud_path()
-        return torch.load(path)
+        return torch.load(path, *args, **kwargs)
 
     def save(self, obj, path: Union[os.PathLike, str], async_save: bool = False) -> None:
         """
@@ -279,6 +295,7 @@ class TrainingManager:
         Returns: None
 
         """
+        assert self._has_initialized, "save() must be called after init()!"
         assert not self._is_saved, "You cannot call `pf.save()` twice within a training step."
         assert self._is_step_started, "You can only call `pf.save()` within a training step scope."
         if async_save:
