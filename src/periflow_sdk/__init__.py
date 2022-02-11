@@ -21,6 +21,7 @@ from periflow_sdk.comm.ipc import IpcCommPurpose, CommResultStatus, get_default_
 from periflow_sdk.utils import ensure_valid_parallelism_config, ensure_divisibility, DistributeConfig
 
 periflow_logger = logging.getLogger("periflow")
+periflow_logger.setLevel(os.environ.get("PERIFLOW_LOG_LEVEL", "INFO"))
 CKPT_FILE_NAME = "model_optim_rng.pt"
 
 
