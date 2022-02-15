@@ -57,7 +57,7 @@ class TrainingManager:
         self._log_path = None
         self._has_locally_logged = False
         self._teardown_at_exit = teardown_at_exit
-        self._emergency_save_step = -1
+        self._emergency_save_step = None
         self._has_initialized = False
         self._dist_config = None
 
