@@ -92,8 +92,7 @@ class TrainingManager:
             periflow_logger.debug("Periflow SDK is working in cloud mode.")
 
             # Environment variable check.
-            required_env_vars = ["CKPT_DIR",
-                                 "RANK",
+            required_env_vars = ["RANK",
                                  "WORLD_SIZE",
                                  "NODE_RANK",
                                  "NUM_NODES",
@@ -264,7 +263,7 @@ class TrainingManager:
     def _get_cloud_path(self) -> Path:
         mp_rank = self._dist_config.mp_rank
         pp_rank = self._dist_config.pp_rank
-        path = Path(os.environ.get("CKPT_DIR")) / "iter_{:07d}/mp_rank_{:02d}_{:03d}".format(
+        path = Path(os.environ["CKPT_DIR"]) / "iter_{:07d}/mp_rank_{:02d}_{:03d}".format(
             self._cur_step, mp_rank, pp_rank) / CKPT_FILE_NAME
         if not path.parent.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +280,7 @@ class TrainingManager:
 
         """
         assert self._has_initialized, "load() must be called after init()!"
-        if not self._is_local:
+        if not self._is_local and "CKPT_DIR" in os.environ:
             path = self._get_cloud_path()
         return torch.load(path, *args, **kwargs)
 
@@ -302,7 +301,7 @@ class TrainingManager:
         if async_save:
             raise NotImplementedError("Asynchronous checkpointing is not supported for now.")
         # Override path in cluster mode.
-        if not self._is_local:
+        if not self._is_local and "CKPT_DIR" in os.environ:
             path = self._get_cloud_path()
         torch.save(obj, path)
         self._is_saved = True
