@@ -42,7 +42,6 @@ class TrainingManager:
 
         self._total_train_steps: int = -1
         self._cur_step: int = 0
-        self._save_method: Optional[SaveType] = None
         self._step_start_time: Optional[float] = None
 
         self._local_rank: Optional[int] = None
@@ -114,14 +113,9 @@ class TrainingManager:
     def _teardown(self) -> None:
         """ Clean up resources.
         """
-        if "NODE_RANK" in os.environ:
-            asyncio.run(self._ipc_channels[IpcCommPurpose.JOB_FINISHED].write({
-                "node_rank": int(os.environ["NODE_RANK"])
-            }))
-
-            for ipc_channel in self._ipc_channels.values():
-                ipc_channel.close()
-                ipc_channel.remove()
+        for ipc_channel in self._ipc_channels.values():
+            ipc_channel.close()
+            ipc_channel.remove()
 
     def _wait_for_emergency_save_request(self) -> None:
         """ Wait for the emergency save request from the IPC channel.
@@ -141,12 +135,14 @@ class TrainingManager:
 
     def init(self,
              total_train_steps: int,
+             start_step: int = 0,
              local_log_name: Optional[str] = None) -> None:
         """Initialize the training manager.
 
         Args:
             total_train_steps: The number of total training steps
-            local_log_name: log file name for local mode
+            start_step: first step of the training (only for local mode)
+            local_log_name: log file name for local mode (only for local mode)
 
         Raises:
             PeriFlowError: when total_train_steps is not an integer
@@ -161,6 +157,8 @@ class TrainingManager:
                     self._log_path = Path(f"./periflow_trainer_{int(time.time())}_{rank}.log")
                 else:
                     self._log_path = Path(f"./periflow_trainer_{int(time.time())}.log")
+
+            self._cur_step = start_step
         else:
             if not isinstance(total_train_steps, int):
                 raise PeriFlowError(f'total_train_steps should be an integer, got {type(total_train_steps)}')
@@ -179,6 +177,12 @@ class TrainingManager:
 
         self.has_initialized = True
 
+    def get_current_step(self) -> int:
+        if self._is_local:
+            periflow_logger.warning("`get_current_step` might return incorrect current step in local mode "
+                                    "(User must pass `start_step` when calling pf.init)")
+        return self._cur_step
+
     @check_initialized
     def start_step(self) -> None:
         """Start a new training step.
@@ -190,10 +194,7 @@ class TrainingManager:
             raise PeriFlowError(
                 'Step already started. Maybe `end_step` is not called for the previous step?)')
 
-        self._save_method = None
-        if not self._is_local:
-            self._cur_step += 1
-
+        self._cur_step += 1
         self._step_start_time = time.monotonic()
 
     @check_initialized
@@ -269,12 +270,15 @@ class TrainingManager:
 
         For the last step, this function is a blocking call
         """
+        if self._is_local:
+            return
+
         if "CKPT_DIR" not in os.environ:
             periflow_logger.warning(
                 "`upload_checkpoint` does nothing because `output_checkpoint_dir` is not configured when job launched.")
             return
 
-        save_type = SaveType.EMERGENCY if self._cur_step == self._emergency_save_step else SaveType.NORMAL
+        save_type = SaveType.EMERGENCY if self.is_emergency_save() else SaveType.NORMAL
 
         msg = {
             "step": self._cur_step,
