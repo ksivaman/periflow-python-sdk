@@ -5,7 +5,7 @@ experiment: cifar-test
 name: cifar-job
 
 # The name of vm type
-vm: azure-v100-4g-eastus-spot
+vm: azure-16gb-v100-4g-eastus-spot
 
 # The number of GPU devices
 num_devices: 16
@@ -35,12 +35,6 @@ job_setting:
   # Path to mount your workspace volume
   workspace:
     mount_path: /workspace
-
-# Distributed training config
-dist:
-  dp_degree: 16
-  pp_degree: 1
-  mp_degree: 1
 
 # Checkpoint config
 checkpoint:
