@@ -3,7 +3,6 @@
 """PeriFlow training manager module.
 """
 
-import asyncio
 import atexit
 import json
 import logging
@@ -17,12 +16,13 @@ from typing import Dict, Optional
 
 import torch
 
-from periflow_sdk.comm.errors import IpcConnectionError, IpcChannelNotOpenedError
 from periflow_sdk.comm.ipc import (
     IpcCommPurpose,
-    CommResultStatus,
     get_default_ipc_channel,
-    IpcChannel
+    IpcChannel,
+    ipc_read,
+    ipc_status_read,
+    ipc_write
 )
 from periflow_sdk.errors import PeriFlowError, PeriFlowInternalError
 from periflow_sdk.utils import (
@@ -44,7 +44,6 @@ class TrainingManager:
 
         self._is_local: bool = os.environ.get("PERIFLOW_ENABLED") != "1"
 
-        self._total_train_steps: int = -1
         self._cur_step: int = 0
         self._step_start_time: Optional[float] = None
 
@@ -62,46 +61,49 @@ class TrainingManager:
         self._log_path: Optional[Path] = None
 
         if not self._is_local:
-
-            # Environment variable check.
-            required_env_vars = ["WORLD_SIZE",
-                                 "NODE_RANK",
-                                 "NUM_NODES",
-                                 "PROCESSED_ITERS"]
-
-            for env_var in required_env_vars:
-                if env_var not in os.environ:
-                    raise PeriFlowInternalError(
-                        f"Environment variable '{env_var}' should be set in cloud mode!"
-                    )
-
-            # Configure dist info
-            world_size = int(os.environ["WORLD_SIZE"])
-            num_nodes = int(os.environ["NUM_NODES"])
-            ensure_divisibility(world_size, num_nodes)
-            devices_per_node = world_size // num_nodes
-
-            if torch.distributed.is_initialized():
-                self._rank = torch.distributed.get_rank()
-            else:
-                self._rank = int(os.environ.get("RANK", "0"))
-
-            self._local_rank = self._rank % devices_per_node
-            self._cur_step = int(os.environ["PROCESSED_ITERS"])
-
-            # IPC Channels
-            self._ipc_channels: Dict[IpcCommPurpose, IpcChannel] = {
-                k: get_default_ipc_channel(purpose=k, local_rank=self._local_rank) for k in IpcCommPurpose
-            }
-            for ipc_channel in self._ipc_channels.values():
-                ipc_channel.open()
-
-            # Start a thread waiting for emergency save request.
-            self._wait_emergency_save_thread = Thread(target=self._wait_for_emergency_save_request, daemon=True)
-            self._wait_emergency_save_thread.start()
-
+            self._cloud_init()
             if teardown_at_exit:
                 atexit.register(self._teardown)
+
+    def _cloud_init(self):
+        """post-init for cloud mode
+        """
+        # Environment variable check.
+        required_env_vars = ["WORLD_SIZE",
+                             "NODE_RANK",
+                             "NUM_NODES",
+                             "PROCESSED_ITERS"]
+
+        for env_var in required_env_vars:
+            if env_var not in os.environ:
+                raise PeriFlowInternalError(
+                    f"Environment variable '{env_var}' should be set in cloud mode!"
+                )
+
+        # Configure dist info
+        world_size = int(os.environ["WORLD_SIZE"])
+        num_nodes = int(os.environ["NUM_NODES"])
+        ensure_divisibility(world_size, num_nodes)
+        devices_per_node = world_size // num_nodes
+
+        if torch.distributed.is_initialized():
+            self._rank = torch.distributed.get_rank()
+        else:
+            self._rank = int(os.environ.get("RANK", "0"))
+
+        self._local_rank = self._rank % devices_per_node
+        self._cur_step = int(os.environ["PROCESSED_ITERS"])
+
+        # IPC Channels
+        self._ipc_channels: Dict[IpcCommPurpose, IpcChannel] = {
+            k: get_default_ipc_channel(purpose=k, local_rank=self._local_rank) for k in IpcCommPurpose
+        }
+        for ipc_channel in self._ipc_channels.values():
+            ipc_channel.open()
+
+        # Start a thread waiting for emergency save request.
+        self._wait_emergency_save_thread = Thread(target=self._wait_for_emergency_save_request, daemon=True)
+        self._wait_emergency_save_thread.start()
 
     @property
     def _is_step_started(self) -> bool:
@@ -125,12 +127,8 @@ class TrainingManager:
         """ Wait for the emergency save request from the IPC channel.
         Do nothing for local mode.
         """
-        try:
-            msg = asyncio.run(self._ipc_channels[IpcCommPurpose.EMERGENCY_SAVE].read())
-        except (IpcConnectionError, IpcChannelNotOpenedError):
-            pass
-        else:
-            self._emergency_save_step = msg['emergency_save_step']
+        msg = ipc_read(self._ipc_channels[IpcCommPurpose.EMERGENCY_SAVE])
+        self._emergency_save_step = msg['emergency_save_step']
 
     def _local_log(self, msg):
         mode = "a" if self._has_locally_logged else "w"
@@ -138,7 +136,7 @@ class TrainingManager:
             log_file.write(f"{json.dumps(msg)}\n")
 
     def init(self,
-             total_train_steps: int,
+             total_train_steps: Optional[int],
              local_log_name: Optional[str] = None) -> None:
         """Initialize the training manager.
 
@@ -160,20 +158,14 @@ class TrainingManager:
                 else:
                     self._log_path = Path(f"./periflow_trainer_{int(time.time())}.log")
         else:
-            if not isinstance(total_train_steps, int):
-                raise PeriFlowError(f'total_train_steps should be an integer, got {type(total_train_steps)}')
-
-            if total_train_steps <= self._cur_step:
+            if total_train_steps is not None and total_train_steps <= self._cur_step:
                 raise PeriFlowError(
                     'total_train_steps should be greater than the current step, '
                     f'current step = {self._cur_step}, total train step = {total_train_steps}')
 
-            self._total_train_steps = total_train_steps
-
-            asyncio.run(
-                self._ipc_channels[IpcCommPurpose.LAST_STEP].write({
-                    "step": self._total_train_steps
-                }))
+            ipc_write(self._ipc_channels[IpcCommPurpose.LAST_STEP], {
+                "step": total_train_steps
+            })
 
         self.has_initialized = True
 
@@ -205,20 +197,12 @@ class TrainingManager:
 
         step_time = time.monotonic() - self._step_start_time
         if not self._is_local:
-            try:
-                msg = {
-                    "step": self._cur_step,
-                    "step_time": step_time,
-                }
-                asyncio.run(self._ipc_channels[IpcCommPurpose.STEP_INFO].write(msg))
-
-                # Wait for ack.
-                ack = asyncio.run(self._ipc_channels[IpcCommPurpose.ACK].read())
-
-                if ack["status"] != CommResultStatus.SUCCESS:
-                    raise PeriFlowInternalError(f'Invalid IPC message from FTModule: {ack}')
-            except IpcConnectionError as e:
-                raise PeriFlowInternalError('IPC connection between training manager and FTModule is broken.') from e
+            msg = {
+                "step": self._cur_step,
+                "step_time": step_time,
+            }
+            ipc_write(self._ipc_channels[IpcCommPurpose.STEP_INFO], msg)
+            ipc_status_read(self._ipc_channels[IpcCommPurpose.ACK])
 
         self._step_start_time = None
 
@@ -238,7 +222,7 @@ class TrainingManager:
 
         Returns: True if emergency save is required for now.
         """
-        return self._emergency_save_step == self._cur_step or self._emergency_save_step == -1
+        return self._emergency_save_step in (self._cur_step, -1)
 
     @check_initialized
     def metric(self, msg: Dict) -> None:
@@ -257,7 +241,7 @@ class TrainingManager:
             new_msg["rank"] = self._rank
             new_msg["local_rank"] = self._local_rank
 
-            asyncio.run(self._ipc_channels[IpcCommPurpose.METRIC].write(new_msg))
+            ipc_write(self._ipc_channels[IpcCommPurpose.METRIC], new_msg)
 
     @check_initialized
     def upload_checkpoint(self):
@@ -281,17 +265,7 @@ class TrainingManager:
             "trigger_time": datetime.now().isoformat()
         }
 
-        try:
-            asyncio.run(self._ipc_channels[IpcCommPurpose.CKPT].write(msg))
-
-            if self._cur_step == self._total_train_steps or save_type is SaveType.EMERGENCY:
-                # Wait for ack.
-                ack = asyncio.run(self._ipc_channels[IpcCommPurpose.CKPT_ACK].read())
-
-                if ack["status"] != CommResultStatus.SUCCESS:
-                    raise PeriFlowInternalError(f'Invalid IPC message from FTModule: {ack}')
-        except IpcConnectionError as e:
-            raise PeriFlowInternalError('IPC connection between training manager and FTModule is broken.') from e
+        ipc_write(self._ipc_channels[IpcCommPurpose.CKPT], msg)
 
 
 periflow = TrainingManager()
