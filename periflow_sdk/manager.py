@@ -42,7 +42,7 @@ class TrainingManager:
     def __init__(self, teardown_at_exit: bool = True):
         self.has_initialized: bool = False
 
-        self._is_local: bool = os.environ.get("PERIFLOW_ENABLED") != "1"
+        self._is_local: bool = os.environ.get("PERIFLOW_ENABLED", "0") != "1"
 
         self._cur_step: int = 0
         self._step_start_time: Optional[float] = None
@@ -60,10 +60,8 @@ class TrainingManager:
         # Used only for local mode
         self._log_path: Optional[Path] = None
 
-        if not self._is_local:
-            self._cloud_init()
-            if teardown_at_exit:
-                atexit.register(self._teardown)
+        if not self._is_local and teardown_at_exit:
+            atexit.register(self._teardown)
 
     def _cloud_init(self):
         """post-init for cloud mode
@@ -136,7 +134,7 @@ class TrainingManager:
             log_file.write(f"{json.dumps(msg)}\n")
 
     def init(self,
-             total_train_steps: Optional[int],
+             total_train_steps: Optional[int] = None,
              local_log_name: Optional[str] = None) -> None:
         """Initialize the training manager.
 
@@ -158,6 +156,8 @@ class TrainingManager:
                 else:
                     self._log_path = Path(f"./periflow_trainer_{int(time.time())}.log")
         else:
+            self._cloud_init()
+
             if total_train_steps is not None and total_train_steps <= self._cur_step:
                 raise PeriFlowError(
                     'total_train_steps should be greater than the current step, '
