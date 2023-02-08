@@ -183,6 +183,28 @@ def test_upload_checkpoint_after_end_step(cloud_manager):
         assert result["step"] == 1
         assert result["save_type"] == SaveType.NORMAL
 
+        cloud_manager.start_step()
+        ipc_write(server_ack_channel, {"status": CommResultStatus.SUCCESS})
+        cloud_manager.end_step()
+        cloud_manager.upload_checkpoint()
+
+        result = ipc_read(ckpt_ipc_channel)
+        assert result["step"] == 2
+        assert result["save_type"] == SaveType.NORMAL
+
+
+def test_upload_checkpoint_twice_in_step(cloud_manager):
+    ckpt_ipc_channel = get_default_ipc_channel(purpose=IpcCommPurpose.CKPT,
+                                               local_rank=0)
+    server_ack_channel = get_default_ipc_channel(purpose=IpcCommPurpose.ACK,
+                                                 local_rank=0)
+    with ckpt_ipc_channel, server_ack_channel:
+        cloud_manager.start_step()
+        ipc_write(server_ack_channel, {"status": CommResultStatus.SUCCESS})
+        cloud_manager.upload_checkpoint()
+        with pytest.raises(PeriFlowError):
+            cloud_manager.upload_checkpoint()
+
 
 def test_cloud_metric(cloud_manager):
     metric_ipc_channel = get_default_ipc_channel(purpose=IpcCommPurpose.METRIC,

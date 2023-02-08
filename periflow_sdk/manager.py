@@ -60,6 +60,9 @@ class TrainingManager:
         # Used only for local mode
         self._log_path: Optional[Path] = None
 
+        # Checkpoint tracking
+        self._checkpoint_saved_cur_step: bool = False
+
         if not self._is_local and teardown_at_exit:
             atexit.register(self._teardown)
 
@@ -182,6 +185,7 @@ class TrainingManager:
 
         self._cur_step += 1
         self._step_start_time = time.monotonic()
+        self._checkpoint_saved_cur_step = False
 
     @check_initialized
     def end_step(self) -> None:
@@ -257,6 +261,11 @@ class TrainingManager:
                 "`upload_checkpoint` does nothing because `output_checkpoint_dir` is not configured when job launched.")
             return
 
+        if self._checkpoint_saved_cur_step:
+            raise PeriFlowError(
+                f"Checkpoint is already uploaded for the step {self._cur_step}. Did you missed using pf.train_step?"
+            )
+
         save_type = SaveType.EMERGENCY if self.is_emergency_save() else SaveType.NORMAL
 
         msg = {
@@ -266,6 +275,7 @@ class TrainingManager:
         }
 
         ipc_write(self._ipc_channels[IpcCommPurpose.CKPT], msg)
+        self._checkpoint_saved_cur_step = True
 
 
 periflow = TrainingManager()
