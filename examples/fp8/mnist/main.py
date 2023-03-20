@@ -1,6 +1,16 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
-# See LICENSE for license information.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
 import torch
@@ -56,8 +66,13 @@ def train(args, model, device, train_loader, optimizer, epoch, use_fp8):
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
-        with te.fp8_autocast(enabled=use_fp8):
+
+        if use_fp8:
+            with te.fp8_autocast(enabled=True):
+                output = model(data)
+        else:
             output = model(data)
+
         loss = F.nll_loss(output, target)
         loss.backward()
         optimizer.step()
@@ -91,8 +106,13 @@ def test(model, device, test_loader, use_fp8):
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
-            with te.fp8_autocast(enabled=use_fp8):
+
+            if use_fp8:
+                with te.fp8_autocast(enabled=True):
+                    output = model(data)
+            else:
                 output = model(data)
+
             test_loss += F.nll_loss(
                 output, target, reduction="sum"
             ).item()  # sum up batch loss
@@ -182,9 +202,6 @@ def main():
     args = parser.parse_args()
     use_cuda = torch.cuda.is_available()
 
-    if args.use_te or args.use_fp8 or args.use_fp8_infer:
-        assert HAVE_TE, "TransformerEngine not installed."
-
     if args.use_fp8 or args.use_fp8_infer:
         args.use_te = True
 
@@ -193,6 +210,9 @@ def main():
 
     if args.use_fp8_infer:
         assert not args.use_fp8, "fp8-infer path currently only supports calibration from a bfloat checkpoint"
+
+    if args.use_te or args.use_fp8 or args.use_fp8_infer:
+        assert HAVE_TE, "TransformerEngine not installed."
 
     torch.manual_seed(args.seed)
 
